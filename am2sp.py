@@ -25,7 +25,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -38,6 +38,8 @@ import subprocess
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com"
 REQUEST_TIMEOUT = 30
+HEARTBEAT_SECONDS = 10
+EXTRACTION_HEARTBEAT_SECONDS = 3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,6 +151,55 @@ def run_music_jxa(config: Dict[str, Any], logger: logging.Logger) -> Dict[str, A
     cmd_prefix = detect_osascript_prefix()
     logger.debug("Using JXA command prefix: %s", " ".join(cmd_prefix))
 
+    # Count first so long extraction logs can report meaningful targets.
+    counts_script = """
+const Music = Application('Music');
+function safeCall(fn, fallback) {
+  try {
+    const v = fn();
+    return v === undefined ? fallback : v;
+  } catch (e) {
+    return fallback;
+  }
+}
+const lib = safeCall(() => Music.libraryPlaylists[0], null);
+const libraryTrackCount = lib ? safeCall(() => lib.tracks().length, 0) : 0;
+const userPlaylistCount = safeCall(() => Music.userPlaylists().length, 0);
+JSON.stringify({ libraryTrackCount, userPlaylistCount });
+"""
+    counts_raw = subprocess.run(
+        cmd_prefix + ["-l", "JavaScript"],
+        input=counts_script,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    expected_tracks: Optional[int] = None
+    expected_playlists: Optional[int] = None
+    if counts_raw.returncode == 0 and counts_raw.stdout.strip():
+        try:
+            counts_payload = json.loads(counts_raw.stdout.strip())
+            expected_tracks = int(counts_payload.get("libraryTrackCount") or 0)
+            expected_playlists = int(counts_payload.get("userPlaylistCount") or 0)
+        except Exception:
+            expected_tracks = None
+            expected_playlists = None
+
+    if expected_tracks is not None and config.get("limit_tracks", 0):
+        expected_tracks = min(expected_tracks, int(config["limit_tracks"]))
+    if expected_playlists is not None and config.get("limit_playlists", 0):
+        expected_playlists = min(expected_playlists, int(config["limit_playlists"]))
+
+    if expected_tracks is not None and expected_playlists is not None:
+        logger.info(
+            "Music.app preflight: expecting up to %d tracks and %d playlists",
+            expected_tracks,
+            expected_playlists,
+        )
+    else:
+        logger.info("Music.app preflight: counting skipped; starting extraction")
+
     jxa_config = json.dumps(config)
     script = f"""
 ObjC.import('Foundation');
@@ -254,14 +305,38 @@ const payload = {{
 JSON.stringify(payload);
 """
 
-    result = subprocess.run(
-        cmd_prefix + ["-l", "JavaScript"],
-        input=script,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    started = time.perf_counter()
+    stop_event = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_event.wait(EXTRACTION_HEARTBEAT_SECONDS):
+            elapsed = time.perf_counter() - started
+            if expected_tracks is not None and expected_playlists is not None:
+                logger.info(
+                    "Music.app extraction in progress (%.0fs elapsed, target <=%d tracks/%d playlists)...",
+                    elapsed,
+                    expected_tracks,
+                    expected_playlists,
+                )
+            else:
+                logger.info("Music.app extraction in progress (%.0fs elapsed)...", elapsed)
+
+    hb_thread = threading.Thread(target=heartbeat, daemon=True)
+    hb_thread.start()
+    try:
+        result = subprocess.run(
+            cmd_prefix + ["-l", "JavaScript"],
+            input=script,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    finally:
+        stop_event.set()
+        hb_thread.join(timeout=0.2)
+
+    logger.info("Music.app extraction command finished in %.1fs", time.perf_counter() - started)
     if result.returncode != 0:
         raise RuntimeError(
             "Music.app extraction failed: "
@@ -871,26 +946,52 @@ def map_tracks_with_cache(
             return key, payload
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(worker, key): key for key in unresolved_keys}
+            future_to_key = {executor.submit(worker, key): key for key in unresolved_keys}
+            pending = set(future_to_key.keys())
             done_count = 0
-            for future in as_completed(futures):
-                key = futures[future]
-                try:
-                    cache_key, payload = future.result()
-                    cache[cache_key] = payload
-                except Exception as exc:
-                    logger.warning("Mapping failed for key=%s: %s", key, exc)
-                    cache[key] = {
-                        "spotify_id": None,
-                        "spotify_uri": None,
-                        "confidence": 0.0,
-                        "reason": f"error:{exc}",
-                        "query": None,
-                        "_updated_at": utc_now().isoformat(),
-                    }
-                done_count += 1
-                if done_count % 25 == 0 or done_count == len(unresolved_keys):
-                    logger.info("Mapped %d/%d unresolved lookup keys", done_count, len(unresolved_keys))
+            total = len(unresolved_keys)
+            started = time.perf_counter()
+
+            while pending:
+                completed, pending = wait(
+                    pending,
+                    timeout=HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not completed:
+                    elapsed = time.perf_counter() - started
+                    logger.info(
+                        "Track mapping in progress: %d/%d resolved (%.1f%%, %.0fs elapsed)",
+                        done_count,
+                        total,
+                        (done_count / total * 100.0) if total else 100.0,
+                        elapsed,
+                    )
+                    continue
+
+                for future in completed:
+                    key = future_to_key[future]
+                    try:
+                        cache_key, payload = future.result()
+                        cache[cache_key] = payload
+                    except Exception as exc:
+                        logger.warning("Mapping failed for key=%s: %s", key, exc)
+                        cache[key] = {
+                            "spotify_id": None,
+                            "spotify_uri": None,
+                            "confidence": 0.0,
+                            "reason": f"error:{exc}",
+                            "query": None,
+                            "_updated_at": utc_now().isoformat(),
+                        }
+                    done_count += 1
+                    if done_count % 25 == 0 or done_count == total:
+                        logger.info(
+                            "Mapped %d/%d unresolved lookup keys (%.1f%%)",
+                            done_count,
+                            total,
+                            (done_count / total * 100.0) if total else 100.0,
+                        )
 
         save_json(cache_path, cache)
 
@@ -923,11 +1024,18 @@ def sync_library(
 ) -> Dict[str, Any]:
     logger.info("Loading existing Spotify saved tracks")
     existing_ids: set[str] = set()
+    scanned = 0
+    last_progress = time.perf_counter()
     for item in client.iter_saved_tracks():
         track = item.get("track") or {}
         tid = track.get("id")
         if tid:
             existing_ids.add(tid)
+        scanned += 1
+        now = time.perf_counter()
+        if scanned % 500 == 0 or (now - last_progress) >= HEARTBEAT_SECONDS:
+            logger.info("Spotify library scan progress: %d tracks inspected", scanned)
+            last_progress = now
     logger.info("Existing Spotify library size: %d", len(existing_ids))
 
     ordered = sort_tracks_by_date_added(source_tracks)
@@ -954,6 +1062,7 @@ def sync_library(
 
     inserted = 0
     fallback_base = utc_now()
+    total_batches = (len(to_add) + 49) // 50 if to_add else 0
     for batch_index, batch in enumerate(chunked(to_add, 50), start=1):
         payload = [
             {
@@ -963,11 +1072,21 @@ def sync_library(
             for i, (track, spotify_id) in enumerate(batch)
         ]
         if dry_run:
-            logger.info("[dry-run] Would add library batch %d of %d tracks", batch_index, len(batch))
+            logger.info(
+                "[dry-run] Would add library batch %d/%d (%d tracks)",
+                batch_index,
+                total_batches,
+                len(batch),
+            )
         else:
             client.save_tracks_with_timestamps(payload)
             inserted += len(batch)
-            logger.info("Added library batch %d (%d tracks)", batch_index, len(batch))
+            logger.info(
+                "Added library batch %d/%d (%d tracks)",
+                batch_index,
+                total_batches,
+                len(batch),
+            )
 
     if dry_run:
         inserted = len(to_add)
@@ -1021,15 +1140,24 @@ def sync_playlists(
     playlist_reports: List[Dict[str, Any]] = []
     unmatched_tracks_total = 0
 
-    for p in source_playlists:
+    total_playlists = len(source_playlists)
+    for playlist_index, p in enumerate(source_playlists, start=1):
         name = str(p.get("name") or "").strip()
         if not name:
             continue
+        logger.info(
+            "Playlist %d/%d: '%s' (%d source tracks)",
+            playlist_index,
+            total_playlists,
+            name,
+            len(p.get("tracks") or []),
+        )
 
         uris: List[str] = []
         unmatched_here = 0
 
-        for raw in p.get("tracks") or []:
+        playlist_tracks = p.get("tracks") or []
+        for track_index, raw in enumerate(playlist_tracks, start=1):
             pid = str(raw.get("persistentId") or "").strip()
             mapping = mapping_by_pid.get(pid)
             if mapping and mapping.spotify_uri:
@@ -1054,6 +1182,13 @@ def sync_playlists(
                 uris.append(resolved.spotify_uri)
             else:
                 unmatched_here += 1
+            if track_index % 100 == 0:
+                logger.info(
+                    "Playlist '%s' mapping progress: %d/%d tracks processed",
+                    name,
+                    track_index,
+                    len(playlist_tracks),
+                )
 
         unmatched_tracks_total += unmatched_here
 
@@ -1237,6 +1372,9 @@ def sync_command(args: argparse.Namespace) -> int:
         )
 
     logger.info("Starting sync (dry_run=%s)", args.dry_run)
+    logger.info(
+        "Phase 1/5: Extracting source data from Music.app (this can take a while for large libraries)"
+    )
 
     extracted = run_music_jxa(
         {
@@ -1274,6 +1412,7 @@ def sync_command(args: argparse.Namespace) -> int:
     )
     client = SpotifyClient(auth=auth, scopes=scopes, logger=logger)
 
+    logger.info("Phase 2/5: Validating Spotify auth and profile")
     me = client.get_me()
     user_id = me.get("id")
     if not user_id:
@@ -1281,6 +1420,7 @@ def sync_command(args: argparse.Namespace) -> int:
     market = args.search_market or me.get("country")
     logger.info("Spotify account: %s (market=%s)", user_id, market)
 
+    logger.info("Phase 3/5: Mapping source tracks to Spotify catalog")
     mapping_by_pid, mapping_stats = map_tracks_with_cache(
         tracks=source_tracks,
         client=client,
@@ -1298,6 +1438,7 @@ def sync_command(args: argparse.Namespace) -> int:
     playlists_report: Dict[str, Any] = {}
 
     if not args.playlists_only:
+        logger.info("Phase 4/5: Syncing main library in date-added order")
         library_report = sync_library(
             source_tracks=source_tracks,
             mapping_by_pid=mapping_by_pid,
@@ -1307,6 +1448,7 @@ def sync_command(args: argparse.Namespace) -> int:
         )
 
     if not args.library_only:
+        logger.info("Phase 5/5: Syncing playlists")
         playlists_report = sync_playlists(
             source_playlists=source_playlists,
             library_tracks_by_pid=library_by_pid,
