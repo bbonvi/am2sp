@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Local agent workspace
+.dev/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
