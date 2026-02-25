@@ -868,31 +868,104 @@ def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def unique_preserve_order(values: Iterable[str]) -> List[str]:
+    """Return unique non-empty values preserving original order."""
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        v = value.strip()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def query_value(raw: str) -> str:
+    """Sanitize a token for Spotify search query usage."""
+    return re.sub(r"\s+", " ", (raw or "").replace('"', " ")).strip()
+
+
+def strip_bracketed(text: str) -> str:
+    """Remove (...) and [...] fragments, then normalize whitespace."""
+    text = re.sub(r"\(.*?\)", " ", text or "")
+    text = re.sub(r"\[.*?\]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def build_title_variants(title: str) -> List[str]:
+    """Generate practical search title variants for cross-platform mismatches."""
+    base = query_value(title)
+    no_brackets = query_value(strip_bracketed(base))
+    no_feat = query_value(
+        re.sub(r"\s+(feat\.?|ft\.?|featuring)\s+.*$", "", no_brackets, flags=re.IGNORECASE)
+    )
+
+    stem_dash = query_value(re.split(r"\s[-–:]\s", no_feat, maxsplit=1)[0]) if no_feat else ""
+    stem_comma = query_value(no_feat.split(",", 1)[0]) if no_feat else ""
+
+    return unique_preserve_order([base, no_brackets, no_feat, stem_dash, stem_comma])
+
+
+def build_artist_variants(artist: str) -> List[str]:
+    """Generate artist variants when source has collaborations/credits."""
+    base = query_value(artist)
+    first_credit = query_value(
+        re.split(r"\s*(?:,|&| x | and | feat\.?|ft\.?|featuring)\s*", base, maxsplit=1, flags=re.IGNORECASE)[
+            0
+        ]
+    )
+    return unique_preserve_order([base, first_credit])
+
+
+def build_track_search_queries(track: SourceTrack) -> List[str]:
+    """Build staged query variants from strict to relaxed."""
+    titles = build_title_variants(track.name)[:5]
+    artists = build_artist_variants(track.artist)[:2]
+    queries: List[str] = []
+
+    # Stage 1: strict fielded searches.
+    for title in titles[:3]:
+        for artist in artists:
+            if title and artist:
+                queries.append(f'track:"{title}" artist:"{artist}"')
+
+    # Stage 2: fielded title-only.
+    for title in titles:
+        if title:
+            queries.append(f'track:"{title}"')
+
+    # Stage 3: relaxed full-text fallback.
+    for title in titles[:3]:
+        for artist in artists:
+            if title and artist:
+                queries.append(f'"{title}" "{artist}"')
+    for title in titles:
+        if title:
+            queries.append(f'"{title}"')
+
+    return unique_preserve_order(queries)[:14]
+
+
 def resolve_track_mapping(
     track: SourceTrack,
     client: SpotifyClient,
     market: Optional[str],
 ) -> MappingResult:
-    def query_value(raw: str) -> str:
-        return re.sub(r'\s+', " ", (raw or "").replace('"', " ")).strip()
-
-    q_title = query_value(track.name)
-    q_artist = query_value(track.artist)
-
-    queries = []
-    if q_title and q_artist:
-        queries.append(f'track:"{q_title}" artist:"{q_artist}"')
-    if q_title:
-        queries.append(f'track:"{q_title}"')
+    queries = build_track_search_queries(track)
 
     best: Optional[Tuple[float, Dict[str, Any], str]] = None
-    for query in queries:
-        items = client.search_tracks(query=query, limit=8, market=market)
+    for query_index, query in enumerate(queries):
+        # Pull a wider candidate window in later relaxed stages.
+        limit = 8 if query_index < 6 else 15
+        items = client.search_tracks(query=query, limit=limit, market=market)
         for item in items:
             score = score_candidate(track, item)
             if best is None or score > best[0]:
                 best = (score, item, query)
-        if best and best[0] >= 55:
+
+        # Early stop once we have a high-confidence candidate.
+        if best and best[0] >= 62:
             break
 
     if not best:
@@ -902,11 +975,12 @@ def resolve_track_mapping(
     if score < 45:
         return MappingResult(None, None, score, "below-threshold", query)
 
+    reason = "matched" if query == queries[0] else "matched-variant"
     return MappingResult(
         spotify_id=item.get("id"),
         spotify_uri=item.get("uri"),
         confidence=score,
-        reason="matched",
+        reason=reason,
         query=query,
     )
 
