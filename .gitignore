@@ -4,9 +4,14 @@
 # Local agent workspace
 .dev/
 
+# CLI runtime state
+data/*
+!data/.gitkeep
+
 # Python cache
 __pycache__/
 *.pyc
+.venv/
 
 # OS/editor
 .DS_Store

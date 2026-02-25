@@ -1,0 +1,17 @@
+[project]
+name = "am2sp"
+version = "0.1.0"
+description = "Transfer Music.app library and playlists to Spotify with date-added ordering."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+am2sp = "am2sp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

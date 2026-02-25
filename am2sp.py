@@ -34,6 +34,26 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 import subprocess
 
+try:
+    from rich.console import Console
+    from rich.logging import RichHandler
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskID,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+except Exception:  # pragma: no cover - optional runtime dependency guard
+    Console = None  # type: ignore[assignment]
+    RichHandler = None  # type: ignore[assignment]
+    Progress = None  # type: ignore[assignment]
+    TaskID = int  # type: ignore[assignment,misc]
+
 
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com"
@@ -100,7 +120,12 @@ def read_env_file(path: Path) -> Dict[str, str]:
     return values
 
 
-def configure_logging(log_file: Path, verbose: bool) -> logging.Logger:
+def configure_logging(
+    log_file: Path,
+    verbose: bool,
+    console_level: Optional[int] = None,
+    rich_console: Optional[Any] = None,
+) -> logging.Logger:
     ensure_dir(log_file.parent)
     logger = logging.getLogger("am2sp")
     logger.setLevel(logging.DEBUG)
@@ -114,13 +139,90 @@ def configure_logging(log_file: Path, verbose: bool) -> logging.Logger:
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
 
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
-    ch.setFormatter(fmt)
+    if rich_console is not None and RichHandler is not None:
+        ch: logging.Handler = RichHandler(
+            console=rich_console,
+            show_time=False,
+            show_level=True,
+            show_path=False,
+            markup=False,
+            rich_tracebacks=False,
+        )
+        ch.setFormatter(logging.Formatter("%(message)s"))
+    else:
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+    ch.setLevel(console_level if console_level is not None else (logging.DEBUG if verbose else logging.INFO))
 
     logger.addHandler(fh)
     logger.addHandler(ch)
     return logger
+
+
+class ProgressUI:
+    """Terminal UI progress controller backed by Rich when available."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = bool(enabled and Progress is not None)
+        self._progress: Optional[Progress] = None
+        self.console = Console(stderr=True) if self.enabled and Console is not None else None
+
+    def __enter__(self) -> "ProgressUI":
+        if self.enabled:
+            self._progress = Progress(
+                SpinnerColumn(style="bold cyan"),
+                TextColumn("[progress.description]{task.description}", justify="left"),
+                BarColumn(bar_width=28, complete_style="bright_cyan", finished_style="bright_green"),
+                TaskProgressColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                transient=False,
+                console=self.console,
+            )
+            self._progress.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._progress:
+            self._progress.stop()
+            self._progress = None
+
+    def add_task(self, description: str, total: Optional[float] = None) -> Optional[TaskID]:
+        if not self._progress:
+            return None
+        return self._progress.add_task(description, total=total)
+
+    def update(
+        self,
+        task_id: Optional[TaskID],
+        *,
+        description: Optional[str] = None,
+        advance: float = 0.0,
+        completed: Optional[float] = None,
+    ) -> None:
+        if not self._progress or task_id is None:
+            return
+        kwargs: Dict[str, Any] = {"advance": advance}
+        if description is not None:
+            kwargs["description"] = description
+        if completed is not None:
+            kwargs["completed"] = completed
+        self._progress.update(task_id, **kwargs)
+
+    def done(self, task_id: Optional[TaskID], description: Optional[str] = None) -> None:
+        if not self._progress or task_id is None:
+            return
+        task = self._progress.tasks[task_id]
+        kwargs: Dict[str, Any] = {}
+        if description is not None:
+            kwargs["description"] = description
+        total = task.total
+        if total is None:
+            # Convert indeterminate tasks to a completed 1/1 row for cleaner terminal rendering.
+            self._progress.update(task_id, total=1, completed=1, **kwargs)
+        else:
+            self._progress.update(task_id, completed=total, **kwargs)
 
 
 def detect_osascript_prefix() -> List[str]:
@@ -147,7 +249,11 @@ def detect_osascript_prefix() -> List[str]:
     )
 
 
-def run_music_jxa(config: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
+def run_music_jxa(
+    config: Dict[str, Any],
+    logger: logging.Logger,
+    ui: Optional[ProgressUI] = None,
+) -> Dict[str, Any]:
     """Extract library + playlists from Music.app via JXA and return parsed JSON."""
     cmd_prefix = detect_osascript_prefix()
     logger.debug("Using JXA command prefix: %s", " ".join(cmd_prefix))
@@ -200,6 +306,12 @@ JSON.stringify({ libraryTrackCount, userPlaylistCount });
         )
     else:
         logger.info("Music.app preflight: counting skipped; starting extraction")
+    extraction_task = None
+    if ui:
+        extraction_task = ui.add_task(
+            "[cyan]Phase 1/5 · Extracting from Music.app",
+            total=None,
+        )
 
     jxa_config = json.dumps(config)
     script = f"""
@@ -331,14 +443,29 @@ JSON.stringify(payload);
         while not stop_event.wait(EXTRACTION_HEARTBEAT_SECONDS):
             elapsed = time.perf_counter() - started
             if expected_tracks is not None and expected_playlists is not None:
-                logger.info(
-                    "Music.app extraction in progress (%.0fs elapsed, target <=%d tracks/%d playlists)...",
-                    elapsed,
-                    expected_tracks,
-                    expected_playlists,
-                )
+                if extraction_task is not None and ui:
+                    ui.update(
+                        extraction_task,
+                        description=(
+                            "[cyan]Phase 1/5 · Extracting from Music.app "
+                            f"({elapsed:.0f}s, target <={expected_tracks} tracks/{expected_playlists} playlists)"
+                        ),
+                    )
+                else:
+                    logger.info(
+                        "Music.app extraction in progress (%.0fs elapsed, target <=%d tracks/%d playlists)...",
+                        elapsed,
+                        expected_tracks,
+                        expected_playlists,
+                    )
             else:
-                logger.info("Music.app extraction in progress (%.0fs elapsed)...", elapsed)
+                if extraction_task is not None and ui:
+                    ui.update(
+                        extraction_task,
+                        description=f"[cyan]Phase 1/5 · Extracting from Music.app ({elapsed:.0f}s)",
+                    )
+                else:
+                    logger.info("Music.app extraction in progress (%.0fs elapsed)...", elapsed)
 
     hb_thread = threading.Thread(target=heartbeat, daemon=True)
     hb_thread.start()
@@ -356,6 +483,8 @@ JSON.stringify(payload);
         hb_thread.join(timeout=0.2)
 
     logger.info("Music.app extraction command finished in %.1fs", time.perf_counter() - started)
+    if extraction_task is not None and ui:
+        ui.done(extraction_task, "[green]Phase 1/5 · Extraction complete")
     if result.returncode != 0:
         raise RuntimeError(
             "Music.app extraction failed: "
@@ -1062,6 +1191,7 @@ def map_tracks_with_cache(
     cache_path: Path,
     max_workers: int,
     logger: logging.Logger,
+    ui: Optional[ProgressUI] = None,
 ) -> Tuple[Dict[str, MappingResult], Dict[str, Any]]:
     """Resolve Spotify IDs for source tracks with persistent on-disk cache."""
     cache: Dict[str, Any] = load_json(cache_path, default={})
@@ -1078,6 +1208,14 @@ def map_tracks_with_cache(
         len(key_to_tracks) - len(unresolved_keys),
         len(unresolved_keys),
     )
+    mapping_task = None
+    if ui:
+        mapping_task = ui.add_task(
+            "[magenta]Phase 3/5 · Mapping tracks",
+            total=max(1, len(unresolved_keys)),
+        )
+        if len(unresolved_keys) == 0:
+            ui.done(mapping_task, "[green]Phase 3/5 · Mapping complete (cache hits)")
 
     if unresolved_keys:
         ensure_dir(cache_path.parent)
@@ -1129,6 +1267,15 @@ def map_tracks_with_cache(
                             "_updated_at": utc_now().isoformat(),
                         }
                     done_count += 1
+                    if mapping_task is not None and ui:
+                        ui.update(
+                            mapping_task,
+                            advance=1,
+                            description=(
+                                "[magenta]Phase 3/5 · Mapping tracks "
+                                f"({done_count}/{total}, {done_count / total * 100.0:.1f}%)"
+                            ),
+                        )
                     if done_count % 25 == 0 or done_count == total:
                         logger.info(
                             "Mapped %d/%d unresolved lookup keys (%.1f%%)",
@@ -1138,6 +1285,8 @@ def map_tracks_with_cache(
                         )
 
         save_json(cache_path, cache)
+        if mapping_task is not None and ui:
+            ui.done(mapping_task, "[green]Phase 3/5 · Mapping complete")
 
     for key, grouped_tracks in key_to_tracks.items():
         payload = cache.get(key) or {}
@@ -1165,8 +1314,10 @@ def sync_library(
     client: SpotifyClient,
     dry_run: bool,
     logger: logging.Logger,
+    ui: Optional[ProgressUI] = None,
 ) -> Dict[str, Any]:
     logger.info("Loading existing Spotify saved tracks")
+    scan_task = ui.add_task("[cyan]Phase 4/5 · Scanning Spotify library", total=None) if ui else None
     existing_ids: set[str] = set()
     scanned = 0
     last_progress = time.perf_counter()
@@ -1176,10 +1327,14 @@ def sync_library(
         if tid:
             existing_ids.add(tid)
         scanned += 1
+        if scan_task is not None and ui and scanned % 50 == 0:
+            ui.update(scan_task, description=f"[cyan]Phase 4/5 · Scanning Spotify library ({scanned} scanned)")
         now = time.perf_counter()
         if scanned % 500 == 0 or (now - last_progress) >= HEARTBEAT_SECONDS:
             logger.info("Spotify library scan progress: %d tracks inspected", scanned)
             last_progress = now
+    if scan_task is not None and ui:
+        ui.done(scan_task, f"[green]Phase 4/5 · Library scan complete ({scanned} scanned)")
     logger.info("Existing Spotify library size: %d", len(existing_ids))
 
     ordered = sort_tracks_by_date_added(source_tracks)
@@ -1207,6 +1362,13 @@ def sync_library(
     inserted = 0
     fallback_base = utc_now()
     total_batches = (len(to_add) + 49) // 50 if to_add else 0
+    write_task = (
+        ui.add_task("[cyan]Phase 4/5 · Applying library updates", total=max(1, total_batches))
+        if ui
+        else None
+    )
+    if total_batches == 0 and write_task is not None and ui:
+        ui.done(write_task, "[green]Phase 4/5 · No library updates needed")
     for batch_index, batch in enumerate(chunked(to_add, 50), start=1):
         payload = [
             {
@@ -1231,9 +1393,17 @@ def sync_library(
                 total_batches,
                 len(batch),
             )
+        if write_task is not None and ui:
+            ui.update(
+                write_task,
+                advance=1,
+                description=f"[cyan]Phase 4/5 · Applying library updates ({batch_index}/{total_batches} batches)",
+            )
 
     if dry_run:
         inserted = len(to_add)
+    if write_task is not None and ui and total_batches > 0:
+        ui.done(write_task, "[green]Phase 4/5 · Library sync complete")
 
     return {
         "source_track_count": len(source_tracks),
@@ -1267,6 +1437,7 @@ def sync_playlists(
     strategy: str,
     market: Optional[str],
     logger: logging.Logger,
+    ui: Optional[ProgressUI] = None,
 ) -> Dict[str, Any]:
     """Sync playlists with ordered content; supports several merge strategies."""
     existing = list(client.iter_user_playlists())
@@ -1285,9 +1456,18 @@ def sync_playlists(
     unmatched_tracks_total = 0
 
     total_playlists = len(source_playlists)
+    playlists_task = (
+        ui.add_task("[blue]Phase 5/5 · Syncing playlists", total=max(1, total_playlists))
+        if ui
+        else None
+    )
+    if total_playlists == 0 and playlists_task is not None and ui:
+        ui.done(playlists_task, "[green]Phase 5/5 · No playlists to sync")
     for playlist_index, p in enumerate(source_playlists, start=1):
         name = str(p.get("name") or "").strip()
         if not name:
+            if playlists_task is not None and ui:
+                ui.update(playlists_task, advance=1)
             continue
         logger.info(
             "Playlist %d/%d: '%s' (%d source tracks)",
@@ -1296,16 +1476,37 @@ def sync_playlists(
             name,
             len(p.get("tracks") or []),
         )
+        if playlists_task is not None and ui:
+            ui.update(
+                playlists_task,
+                description=f"[blue]Phase 5/5 · Playlist {playlist_index}/{total_playlists}: {name}",
+            )
 
         uris: List[str] = []
         unmatched_here = 0
 
         playlist_tracks = p.get("tracks") or []
+        track_map_task = (
+            ui.add_task(
+                f"[blue]Mapping tracks for '{name}'",
+                total=max(1, len(playlist_tracks)),
+            )
+            if ui
+            else None
+        )
+        if len(playlist_tracks) == 0 and track_map_task is not None and ui:
+            ui.done(track_map_task, f"[green]{name}: empty playlist")
         for track_index, raw in enumerate(playlist_tracks, start=1):
             pid = str(raw.get("persistentId") or "").strip()
             mapping = mapping_by_pid.get(pid)
             if mapping and mapping.spotify_uri:
                 uris.append(mapping.spotify_uri)
+                if track_map_task is not None and ui:
+                    ui.update(
+                        track_map_task,
+                        advance=1,
+                        description=f"[blue]{name} · mapping {track_index}/{len(playlist_tracks)}",
+                    )
                 continue
 
             # Fallback: track appears only in playlist export and not in library map.
@@ -1326,6 +1527,12 @@ def sync_playlists(
                 uris.append(resolved.spotify_uri)
             else:
                 unmatched_here += 1
+            if track_map_task is not None and ui:
+                ui.update(
+                    track_map_task,
+                    advance=1,
+                    description=f"[blue]{name} · mapping {track_index}/{len(playlist_tracks)}",
+                )
             if track_index % 100 == 0:
                 logger.info(
                     "Playlist '%s' mapping progress: %d/%d tracks processed",
@@ -1333,6 +1540,8 @@ def sync_playlists(
                     track_index,
                     len(playlist_tracks),
                 )
+        if track_map_task is not None and ui and len(playlist_tracks) > 0:
+            ui.done(track_map_task, f"[green]{name}: mapping done")
 
         unmatched_tracks_total += unmatched_here
 
@@ -1347,6 +1556,8 @@ def sync_playlists(
                     "unmatched_tracks": unmatched_here,
                 }
             )
+            if playlists_task is not None and ui:
+                ui.update(playlists_task, advance=1)
             continue
 
         existing_candidates = existing_by_name.get(name, [])
@@ -1378,6 +1589,8 @@ def sync_playlists(
                         "unmatched_tracks": unmatched_here,
                     }
                 )
+                if playlists_task is not None and ui:
+                    ui.update(playlists_task, advance=1)
                 continue
             action = "create"
             if not dry_run:
@@ -1443,6 +1656,11 @@ def sync_playlists(
                 "unmatched_tracks": unmatched_here,
             }
         )
+        if playlists_task is not None and ui:
+            ui.update(playlists_task, advance=1)
+
+    if playlists_task is not None and ui and total_playlists > 0:
+        ui.done(playlists_task, "[green]Phase 5/5 · Playlist sync complete")
 
     return {
         "source_playlist_count": len(source_playlists),
@@ -1464,28 +1682,38 @@ def collect_source_tracks_and_playlists(raw: Dict[str, Any]) -> Tuple[List[Sourc
 
 def extract_command(args: argparse.Namespace) -> int:
     log_file = Path(args.log_file)
-    logger = configure_logging(log_file=log_file, verbose=args.verbose)
-
-    payload = run_music_jxa(
-        {
-            "include_smart_playlists": args.include_smart_playlists,
-            "skip_empty_playlists": not args.include_empty_playlists,
-            "limit_tracks": args.limit_tracks,
-            "limit_playlists": args.limit_playlists,
-        },
-        logger=logger,
+    ui_enabled = bool(not args.no_rich_progress and Progress is not None)
+    ui = ProgressUI(enabled=ui_enabled)
+    console_level = logging.WARNING if ui_enabled and not args.verbose else None
+    logger = configure_logging(
+        log_file=log_file,
+        verbose=args.verbose,
+        console_level=console_level,
+        rich_console=ui.console,
     )
 
-    out_file = Path(args.output)
-    ensure_dir(out_file.parent)
-    out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with ui:
+        payload = run_music_jxa(
+            {
+                "include_smart_playlists": args.include_smart_playlists,
+                "skip_empty_playlists": not args.include_empty_playlists,
+                "limit_tracks": args.limit_tracks,
+                "limit_playlists": args.limit_playlists,
+            },
+            logger=logger,
+            ui=ui,
+        )
 
-    logger.info(
-        "Extracted %d library tracks and %d playlists -> %s",
-        payload.get("libraryTrackCount", 0),
-        payload.get("playlistCount", 0),
-        out_file,
-    )
+        out_file = Path(args.output)
+        ensure_dir(out_file.parent)
+        out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        logger.info(
+            "Extracted %d library tracks and %d playlists -> %s",
+            payload.get("libraryTrackCount", 0),
+            payload.get("playlistCount", 0),
+            out_file,
+        )
     return 0
 
 
@@ -1500,7 +1728,15 @@ def sync_command(args: argparse.Namespace) -> int:
     ensure_dir(state_dir / "reports")
 
     log_file = Path(args.log_file or (state_dir / "logs" / f"sync-{timestamp}.log"))
-    logger = configure_logging(log_file=log_file, verbose=args.verbose)
+    ui_enabled = bool(not args.no_rich_progress and Progress is not None)
+    ui = ProgressUI(enabled=ui_enabled)
+    console_level = logging.WARNING if ui_enabled and not args.verbose else None
+    logger = configure_logging(
+        log_file=log_file,
+        verbose=args.verbose,
+        console_level=console_level,
+        rich_console=ui.console,
+    )
 
     report_file = Path(args.report_file or (state_dir / "reports" / f"report-{timestamp}.json"))
     cache_file = state_dir / "cache" / "track_search_cache.json"
@@ -1522,149 +1758,160 @@ def sync_command(args: argparse.Namespace) -> int:
 
     logger.info("Starting sync (dry_run=%s)", args.dry_run)
     logger.info("Spotify OAuth redirect URI: %s", redirect_uri)
-    logger.info(
-        "Phase 1/5: Extracting source data from Music.app (this can take a while for large libraries)"
-    )
 
-    extracted = run_music_jxa(
-        {
-            "include_smart_playlists": args.include_smart_playlists,
-            "skip_empty_playlists": not args.include_empty_playlists,
-            "limit_tracks": args.limit_tracks,
-            "limit_playlists": args.limit_playlists,
-        },
-        logger=logger,
-    )
-
-    source_tracks, source_playlists = collect_source_tracks_and_playlists(extracted)
-    library_by_pid = {t.persistent_id: t for t in source_tracks}
-    logger.info(
-        "Source extracted: %d tracks, %d playlists",
-        len(source_tracks),
-        len(source_playlists),
-    )
-
-    scopes = [
-        "user-library-read",
-        "user-library-modify",
-        "playlist-read-private",
-        "playlist-modify-public",
-        "playlist-modify-private",
-    ]
-
-    auth = SpotifyAuth(
-        client_id=client_id,
-        client_secret=client_secret,
-        redirect_uri=redirect_uri,
-        token_cache_path=token_file,
-        no_browser=args.no_browser,
-        callback_wait_seconds=args.oauth_callback_wait_seconds,
-        logger=logger,
-    )
-    client = SpotifyClient(
-        auth=auth,
-        scopes=scopes,
-        logger=logger,
-        search_min_interval_seconds=args.search_min_interval,
-    )
-    logger.info(
-        "Search throttle: min interval %.2fs; mapping workers=%d",
-        args.search_min_interval,
-        args.max_workers,
-    )
-
-    logger.info("Phase 2/5: Validating Spotify auth and profile")
-    me = client.get_me()
-    user_id = me.get("id")
-    if not user_id:
-        raise RuntimeError("Could not determine Spotify user ID from /me")
-    market = args.search_market or me.get("country")
-    logger.info("Spotify account: %s (market=%s)", user_id, market)
-
-    logger.info("Phase 3/5: Mapping source tracks to Spotify catalog")
-    mapping_by_pid, mapping_stats = map_tracks_with_cache(
-        tracks=source_tracks,
-        client=client,
-        market=market,
-        cache_path=cache_file,
-        max_workers=args.max_workers,
-        logger=logger,
-    )
-
-    matched = sum(1 for m in mapping_by_pid.values() if m.spotify_id)
-    unmatched = len(mapping_by_pid) - matched
-    logger.info("Mapping summary: matched=%d unmatched=%d", matched, unmatched)
-
-    library_report: Dict[str, Any] = {}
-    playlists_report: Dict[str, Any] = {}
-
-    if not args.playlists_only:
-        logger.info("Phase 4/5: Syncing main library in date-added order")
-        library_report = sync_library(
-            source_tracks=source_tracks,
-            mapping_by_pid=mapping_by_pid,
-            client=client,
-            dry_run=args.dry_run,
+    with ui:
+        phase_task = ui.add_task("[bold cyan]Sync pipeline", total=5)
+        logger.info(
+            "Phase 1/5: Extracting source data from Music.app (this can take a while for large libraries)"
+        )
+        extracted = run_music_jxa(
+            {
+                "include_smart_playlists": args.include_smart_playlists,
+                "skip_empty_playlists": not args.include_empty_playlists,
+                "limit_tracks": args.limit_tracks,
+                "limit_playlists": args.limit_playlists,
+            },
             logger=logger,
+            ui=ui,
+        )
+        ui.update(phase_task, advance=1, description="[bold cyan]Sync pipeline · extracted")
+
+        source_tracks, source_playlists = collect_source_tracks_and_playlists(extracted)
+        library_by_pid = {t.persistent_id: t for t in source_tracks}
+        logger.info(
+            "Source extracted: %d tracks, %d playlists",
+            len(source_tracks),
+            len(source_playlists),
         )
 
-    if not args.library_only:
-        logger.info("Phase 5/5: Syncing playlists")
-        playlists_report = sync_playlists(
-            source_playlists=source_playlists,
-            library_tracks_by_pid=library_by_pid,
-            mapping_by_pid=mapping_by_pid,
+        scopes = [
+            "user-library-read",
+            "user-library-modify",
+            "playlist-read-private",
+            "playlist-modify-public",
+            "playlist-modify-private",
+        ]
+
+        auth = SpotifyAuth(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            token_cache_path=token_file,
+            no_browser=args.no_browser,
+            callback_wait_seconds=args.oauth_callback_wait_seconds,
+            logger=logger,
+        )
+        client = SpotifyClient(
+            auth=auth,
+            scopes=scopes,
+            logger=logger,
+            search_min_interval_seconds=args.search_min_interval,
+        )
+        logger.info(
+            "Search throttle: min interval %.2fs; mapping workers=%d",
+            args.search_min_interval,
+            args.max_workers,
+        )
+
+        logger.info("Phase 2/5: Validating Spotify auth and profile")
+        me = client.get_me()
+        user_id = me.get("id")
+        if not user_id:
+            raise RuntimeError("Could not determine Spotify user ID from /me")
+        market = args.search_market or me.get("country")
+        logger.info("Spotify account: %s (market=%s)", user_id, market)
+        ui.update(phase_task, advance=1, description="[bold cyan]Sync pipeline · auth ready")
+
+        logger.info("Phase 3/5: Mapping source tracks to Spotify catalog")
+        mapping_by_pid, mapping_stats = map_tracks_with_cache(
+            tracks=source_tracks,
             client=client,
-            user_id=user_id,
-            dry_run=args.dry_run,
-            strategy=args.playlist_strategy,
             market=market,
+            cache_path=cache_file,
+            max_workers=args.max_workers,
             logger=logger,
+            ui=ui,
         )
+        ui.update(phase_task, advance=1, description="[bold cyan]Sync pipeline · mapping done")
 
-    unmatched_examples = []
-    for t in source_tracks:
-        m = mapping_by_pid.get(t.persistent_id)
-        if m and not m.spotify_id:
-            unmatched_examples.append(
-                {
-                    "name": t.name,
-                    "artist": t.artist,
-                    "album": t.album,
-                    "reason": m.reason,
-                    "confidence": round(m.confidence, 2),
-                }
+        matched = sum(1 for m in mapping_by_pid.values() if m.spotify_id)
+        unmatched = len(mapping_by_pid) - matched
+        logger.info("Mapping summary: matched=%d unmatched=%d", matched, unmatched)
+
+        library_report: Dict[str, Any] = {}
+        playlists_report: Dict[str, Any] = {}
+
+        if not args.playlists_only:
+            logger.info("Phase 4/5: Syncing main library in date-added order")
+            library_report = sync_library(
+                source_tracks=source_tracks,
+                mapping_by_pid=mapping_by_pid,
+                client=client,
+                dry_run=args.dry_run,
+                logger=logger,
+                ui=ui,
             )
-        if len(unmatched_examples) >= 30:
-            break
+        ui.update(phase_task, advance=1, description="[bold cyan]Sync pipeline · library done")
 
-    finished = utc_now()
-    elapsed = time.perf_counter() - started
-    report = {
-        "generated_at": finished.isoformat(),
-        "dry_run": args.dry_run,
-        "source": {
-            "library_track_count": len(source_tracks),
-            "playlist_count": len(source_playlists),
-        },
-        "mapping": {
-            "matched": matched,
-            "unmatched": unmatched,
-            **mapping_stats,
-        },
-        "library": library_report,
-        "playlists": playlists_report,
-        "api_stats": client.stats,
-        "unmatched_examples": unmatched_examples,
-        "log_file": str(log_file),
-        "elapsed_seconds": round(elapsed, 2),
-    }
+        if not args.library_only:
+            logger.info("Phase 5/5: Syncing playlists")
+            playlists_report = sync_playlists(
+                source_playlists=source_playlists,
+                library_tracks_by_pid=library_by_pid,
+                mapping_by_pid=mapping_by_pid,
+                client=client,
+                user_id=user_id,
+                dry_run=args.dry_run,
+                strategy=args.playlist_strategy,
+                market=market,
+                logger=logger,
+                ui=ui,
+            )
+        ui.update(phase_task, advance=1, description="[bold green]Sync pipeline · complete")
 
-    save_json(report_file, report)
+        unmatched_examples = []
+        for t in source_tracks:
+            m = mapping_by_pid.get(t.persistent_id)
+            if m and not m.spotify_id:
+                unmatched_examples.append(
+                    {
+                        "name": t.name,
+                        "artist": t.artist,
+                        "album": t.album,
+                        "reason": m.reason,
+                        "confidence": round(m.confidence, 2),
+                    }
+                )
+            if len(unmatched_examples) >= 30:
+                break
 
-    logger.info("Sync completed in %.1fs", elapsed)
-    logger.info("Report: %s", report_file)
-    logger.info("Log file: %s", log_file)
+        finished = utc_now()
+        elapsed = time.perf_counter() - started
+        report = {
+            "generated_at": finished.isoformat(),
+            "dry_run": args.dry_run,
+            "source": {
+                "library_track_count": len(source_tracks),
+                "playlist_count": len(source_playlists),
+            },
+            "mapping": {
+                "matched": matched,
+                "unmatched": unmatched,
+                **mapping_stats,
+            },
+            "library": library_report,
+            "playlists": playlists_report,
+            "api_stats": client.stats,
+            "unmatched_examples": unmatched_examples,
+            "log_file": str(log_file),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+        save_json(report_file, report)
+
+        logger.info("Sync completed in %.1fs", elapsed)
+        logger.info("Report: %s", report_file)
+        logger.info("Log file: %s", log_file)
 
     return 0
 
@@ -1677,18 +1924,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     extract_p = sub.add_parser("extract", help="Export library/playlists from Music.app to JSON")
-    extract_p.add_argument("--output", default=".dev/exports/music-export.json")
+    extract_p.add_argument("--output", default="data/exports/music-export.json")
     extract_p.add_argument("--include-smart-playlists", action="store_true")
     extract_p.add_argument("--include-empty-playlists", action="store_true")
     extract_p.add_argument("--limit-tracks", type=int, default=0)
     extract_p.add_argument("--limit-playlists", type=int, default=0)
-    extract_p.add_argument("--log-file", default=".dev/logs/extract.log")
+    extract_p.add_argument("--log-file", default="data/logs/extract.log")
+    extract_p.add_argument("--no-rich-progress", action="store_true")
     extract_p.add_argument("--verbose", action="store_true")
     extract_p.set_defaults(func=extract_command)
 
     sync_p = sub.add_parser("sync", help="Run full transfer from Music.app to Spotify")
     sync_p.add_argument("--env-file", default=".env")
-    sync_p.add_argument("--state-dir", default=".dev")
+    sync_p.add_argument("--state-dir", default="data")
     sync_p.add_argument("--log-file", default="")
     sync_p.add_argument("--report-file", default="")
     sync_p.add_argument("--spotify-client-id", default="")
@@ -1716,6 +1964,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--limit-playlists", type=int, default=0)
     sync_p.add_argument("--no-browser", action="store_true")
     sync_p.add_argument("--oauth-callback-wait-seconds", type=int, default=25)
+    sync_p.add_argument("--no-rich-progress", action="store_true")
     sync_p.add_argument("--verbose", action="store_true")
     sync_p.set_defaults(func=sync_command)
 

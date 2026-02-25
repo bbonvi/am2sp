@@ -10,9 +10,7 @@ Priorities:
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 Set `.env`:
@@ -30,19 +28,19 @@ Important: `SPOTIFY_REDIRECT_URI` must exactly match one Redirect URI in your Sp
 Extract source data only:
 
 ```bash
-python3 am2sp.py extract --output .dev/exports/music-export.json
+uv run am2sp.py extract --output data/exports/music-export.json
 ```
 
 Dry-run full sync:
 
 ```bash
-python3 am2sp.py sync --dry-run
+uv run am2sp.py sync --dry-run
 ```
 
 Real sync:
 
 ```bash
-python3 am2sp.py sync
+uv run am2sp.py sync
 ```
 
 Useful flags:
@@ -52,4 +50,6 @@ Useful flags:
 - `--limit-tracks N`, `--limit-playlists N`
 - `--no-browser`
 
-Outputs go to `.dev/logs/` and `.dev/reports/` by default.
+Outputs go to `data/` by default (`data/logs`, `data/reports`, `data/cache`).
+
+Rich progress UI is enabled by default. Disable with `--no-rich-progress`.
