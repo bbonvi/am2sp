@@ -697,7 +697,8 @@ def normalize_text(value: str) -> str:
     value = (value or "").lower()
     value = re.sub(r"\(.*?\)", " ", value)
     value = re.sub(r"\[.*?\]", " ", value)
-    value = re.sub(r"[^a-z0-9]+", " ", value)
+    # Keep unicode letters/digits for non-Latin titles/artists.
+    value = re.sub(r"[\W_]+", " ", value, flags=re.UNICODE)
     return re.sub(r"\s+", " ", value).strip()
 
 
@@ -768,10 +769,17 @@ def resolve_track_mapping(
     client: SpotifyClient,
     market: Optional[str],
 ) -> MappingResult:
+    def query_value(raw: str) -> str:
+        return re.sub(r'\s+', " ", (raw or "").replace('"', " ")).strip()
+
+    q_title = query_value(track.name)
+    q_artist = query_value(track.artist)
+
     queries = []
-    if track.artist:
-        queries.append(f'track:"{track.name}" artist:"{track.artist}"')
-    queries.append(f'track:"{track.name}"')
+    if q_title and q_artist:
+        queries.append(f'track:"{q_title}" artist:"{q_artist}"')
+    if q_title:
+        queries.append(f'track:"{q_title}"')
 
     best: Optional[Tuple[float, Dict[str, Any], str]] = None
     for query in queries:
