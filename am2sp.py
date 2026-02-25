@@ -411,6 +411,7 @@ class SpotifyAuth:
         redirect_uri: str,
         token_cache_path: Path,
         no_browser: bool,
+        callback_wait_seconds: int,
         logger: logging.Logger,
     ):
         self.client_id = client_id
@@ -418,6 +419,7 @@ class SpotifyAuth:
         self.redirect_uri = redirect_uri
         self.token_cache_path = token_cache_path
         self.no_browser = no_browser
+        self.callback_wait_seconds = max(5, callback_wait_seconds)
         self.logger = logger
         self._lock = threading.Lock()
         self._token_cache = self._load_cache()
@@ -534,13 +536,16 @@ class SpotifyAuth:
         thread.start()
 
         self.logger.info("Open this URL to authorize:\n%s", auth_url)
+        self.logger.info(
+            "If browser lands on an error page (for example HTTP 502), copy the full callback URL and paste it in the terminal when prompted."
+        )
         if not self.no_browser:
             try:
                 webbrowser.open(auth_url, new=2)
             except Exception as exc:
                 self.logger.warning("Failed to open browser automatically: %s", exc)
 
-        OAuthCallbackHandler.event.wait(timeout=240)
+        OAuthCallbackHandler.event.wait(timeout=self.callback_wait_seconds)
         server.server_close()
 
         result = OAuthCallbackHandler.result
@@ -548,9 +553,8 @@ class SpotifyAuth:
             raise RuntimeError(f"Spotify auth error: {result.error}")
 
         if not result.code:
-            self.logger.info(
-                "No callback received. Paste the full redirected URL or code value."
-            )
+            self.logger.info("No callback received within %ss.", self.callback_wait_seconds)
+            self.logger.info("Paste the full redirected URL or raw code value now.")
             pasted = input("Authorization response: ").strip()
             if pasted.startswith("http"):
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query)
@@ -1439,6 +1443,7 @@ def sync_command(args: argparse.Namespace) -> int:
         redirect_uri=redirect_uri,
         token_cache_path=token_file,
         no_browser=args.no_browser,
+        callback_wait_seconds=args.oauth_callback_wait_seconds,
         logger=logger,
     )
     client = SpotifyClient(auth=auth, scopes=scopes, logger=logger)
@@ -1579,6 +1584,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--limit-tracks", type=int, default=0)
     sync_p.add_argument("--limit-playlists", type=int, default=0)
     sync_p.add_argument("--no-browser", action="store_true")
+    sync_p.add_argument("--oauth-callback-wait-seconds", type=int, default=25)
     sync_p.add_argument("--verbose", action="store_true")
     sync_p.set_defaults(func=sync_command)
 
