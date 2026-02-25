@@ -21,6 +21,7 @@ import os
 import random
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.parse
@@ -1227,7 +1228,10 @@ def map_tracks_with_cache(
             payload["_updated_at"] = utc_now().isoformat()
             return key, payload
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        interrupted = False
+        pending: set[Any] = set()
+        try:
             future_to_key = {executor.submit(worker, key): key for key in unresolved_keys}
             pending = set(future_to_key.keys())
             done_count = 0
@@ -1283,6 +1287,15 @@ def map_tracks_with_cache(
                             total,
                             (done_count / total * 100.0) if total else 100.0,
                         )
+        except KeyboardInterrupt:
+            interrupted = True
+            logger.warning(
+                "Interrupted during track mapping; cancelling %d pending lookup tasks",
+                len(pending),
+            )
+            raise
+        finally:
+            executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
 
         save_json(cache_path, cache)
         if mapping_task is not None and ui:
@@ -1978,7 +1991,15 @@ def main() -> int:
     if getattr(args, "library_only", False) and getattr(args, "playlists_only", False):
         raise SystemExit("Use only one of --library-only / --playlists-only")
 
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:
+        logger = logging.getLogger("am2sp")
+        if logger.handlers:
+            logger.warning("Interrupted by user (Ctrl-C)")
+        else:
+            print("Interrupted by user (Ctrl-C)", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
