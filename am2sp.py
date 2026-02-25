@@ -40,6 +40,7 @@ SPOTIFY_ACCOUNTS_BASE = "https://accounts.spotify.com"
 REQUEST_TIMEOUT = 30
 HEARTBEAT_SECONDS = 10
 EXTRACTION_HEARTBEAT_SECONDS = 3
+DEFAULT_SPOTIFY_REDIRECT_URI = "http://127.0.0.1:8888/callback"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -229,16 +230,46 @@ function isoDate(v) {{
   }}
 }}
 
-function trackToObj(t) {{
-  return {{
-    persistentId: clean(safeCall(() => t.persistentID(), '')),
-    databaseId: safeCall(() => Number(t.databaseID()), null),
-    name: clean(safeCall(() => t.name(), '')),
-    artist: clean(safeCall(() => t.artist(), '')),
-    album: clean(safeCall(() => t.album(), '')),
-    duration: safeCall(() => Number(t.duration()), null),
-    dateAdded: isoDate(safeCall(() => t.dateAdded(), null)),
-  }};
+function arr(v) {{
+  if (v === null || v === undefined) return [];
+  return Array.isArray(v) ? v : [v];
+}}
+
+function tracksToObjs(trackSpec, limit) {{
+  const names = arr(safeCall(() => trackSpec.name(), []));
+  const artists = arr(safeCall(() => trackSpec.artist(), []));
+  const albums = arr(safeCall(() => trackSpec.album(), []));
+  const pids = arr(safeCall(() => trackSpec.persistentID(), []));
+  const dbids = arr(safeCall(() => trackSpec.databaseID(), []));
+  const durs = arr(safeCall(() => trackSpec.duration(), []));
+  const dates = arr(safeCall(() => trackSpec.dateAdded(), []));
+
+  const total = Math.max(
+    names.length,
+    artists.length,
+    albums.length,
+    pids.length,
+    dbids.length,
+    durs.length,
+    dates.length
+  );
+
+  const cap = (limit !== null && limit >= 0) ? Math.min(total, limit) : total;
+  const out = [];
+  for (let i = 0; i < cap; i++) {{
+    const obj = {{
+      persistentId: clean(pids[i] ?? ''),
+      databaseId: (dbids[i] === null || dbids[i] === undefined || dbids[i] === '') ? null : Number(dbids[i]),
+      name: clean(names[i] ?? ''),
+      artist: clean(artists[i] ?? ''),
+      album: clean(albums[i] ?? ''),
+      duration: (durs[i] === null || durs[i] === undefined || durs[i] === '') ? null : Number(durs[i]),
+      dateAdded: isoDate(dates[i] ?? null),
+    }};
+    if (!obj.persistentId || !obj.name) continue;
+    out.push(obj);
+  }}
+  return out;
 }}
 
 const cfg = {jxa_config};
@@ -250,15 +281,9 @@ if (!libPlaylist) {{
   throw new Error('Could not access Music library playlist');
 }}
 
-const libTracks = safeCall(() => libPlaylist.tracks(), []);
-const library = [];
+const libTracks = safeCall(() => libPlaylist.tracks, null);
 const libraryLimit = cfg.limit_tracks && cfg.limit_tracks > 0 ? cfg.limit_tracks : null;
-for (let i = 0; i < libTracks.length; i++) {{
-  if (libraryLimit !== null && library.length >= libraryLimit) break;
-  const obj = trackToObj(libTracks[i]);
-  if (!obj.persistentId || !obj.name) continue;
-  library.push(obj);
-}}
+const library = libTracks ? tracksToObjs(libTracks, libraryLimit) : [];
 
 const allUserPlaylists = safeCall(() => Music.userPlaylists(), []);
 const playlists = [];
@@ -275,13 +300,7 @@ for (let i = 0; i < allUserPlaylists.length; i++) {{
   const pid = clean(safeCall(() => p.persistentID(), ''));
   if (!pname || !pid) continue;
 
-  const ptracksRaw = safeCall(() => p.tracks(), []);
-  const ptracks = [];
-  for (let j = 0; j < ptracksRaw.length; j++) {{
-    const t = trackToObj(ptracksRaw[j]);
-    if (!t.name) continue;
-    ptracks.push(t);
-  }}
+  const ptracks = tracksToObjs(safeCall(() => p.tracks, null), null);
 
   if (cfg.skip_empty_playlists && ptracks.length === 0) continue;
 
@@ -497,6 +516,7 @@ class SpotifyAuth:
             "code_challenge": code_challenge,
         }
         auth_url = f"{SPOTIFY_ACCOUNTS_BASE}/authorize?{urllib.parse.urlencode(params)}"
+        self.logger.info("Using Spotify redirect URI: %s", self.redirect_uri)
 
         OAuthCallbackHandler.result = AuthCodeResult()
         OAuthCallbackHandler.event.clear()
@@ -560,8 +580,13 @@ class SpotifyAuth:
             timeout=REQUEST_TIMEOUT,
         )
         if token_resp.status_code != 200:
+            guidance = ""
+            if "invalid redirect uri" in token_resp.text.lower():
+                guidance = (
+                    " The redirect URI must exactly match one configured in the Spotify app settings."
+                )
             raise RuntimeError(
-                f"Token exchange failed ({token_resp.status_code}): {token_resp.text[:500]}"
+                f"Token exchange failed ({token_resp.status_code}): {token_resp.text[:500]}{guidance}"
             )
         self._update_token_cache(token_resp.json())
 
@@ -1365,6 +1390,11 @@ def sync_command(args: argparse.Namespace) -> int:
     env_values = read_env_file(Path(args.env_file))
     client_id = args.spotify_client_id or env_values.get("SPOTIFY_CLIENT_ID")
     client_secret = args.spotify_client_secret or env_values.get("SPOTIFY_SECRET")
+    redirect_uri = (
+        args.spotify_redirect_uri
+        or env_values.get("SPOTIFY_REDIRECT_URI")
+        or DEFAULT_SPOTIFY_REDIRECT_URI
+    )
 
     if not client_id:
         raise RuntimeError(
@@ -1372,6 +1402,7 @@ def sync_command(args: argparse.Namespace) -> int:
         )
 
     logger.info("Starting sync (dry_run=%s)", args.dry_run)
+    logger.info("Spotify OAuth redirect URI: %s", redirect_uri)
     logger.info(
         "Phase 1/5: Extracting source data from Music.app (this can take a while for large libraries)"
     )
@@ -1405,7 +1436,7 @@ def sync_command(args: argparse.Namespace) -> int:
     auth = SpotifyAuth(
         client_id=client_id,
         client_secret=client_secret,
-        redirect_uri=args.spotify_redirect_uri,
+        redirect_uri=redirect_uri,
         token_cache_path=token_file,
         no_browser=args.no_browser,
         logger=logger,
@@ -1532,9 +1563,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--report-file", default="")
     sync_p.add_argument("--spotify-client-id", default="")
     sync_p.add_argument("--spotify-client-secret", default="")
-    sync_p.add_argument(
-        "--spotify-redirect-uri", default="http://127.0.0.1:8888/callback"
-    )
+    sync_p.add_argument("--spotify-redirect-uri", default="")
     sync_p.add_argument("--search-market", default="")
     sync_p.add_argument("--max-workers", type=int, default=6)
     sync_p.add_argument(

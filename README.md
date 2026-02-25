@@ -20,7 +20,10 @@ Set `.env`:
 ```bash
 SPOTIFY_CLIENT_ID=...
 SPOTIFY_SECRET=...
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```
+
+Important: `SPOTIFY_REDIRECT_URI` must exactly match one Redirect URI in your Spotify app settings.
 
 ## Usage
 
