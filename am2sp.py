@@ -604,11 +604,17 @@ class SpotifyClient:
         scopes: Iterable[str],
         logger: logging.Logger,
         max_retries: int = 6,
+        search_min_interval_seconds: float = 0.15,
     ):
         self.auth = auth
         self.scopes = list(scopes)
         self.logger = logger
         self.max_retries = max_retries
+        self.base_search_min_interval = max(0.0, float(search_min_interval_seconds))
+        self.search_min_interval = self.base_search_min_interval
+        self._search_next_at = 0.0
+        self._search_cooldown_until = 0.0
+        self._search_lock = threading.Lock()
         self.stats: Dict[str, int] = {
             "http_calls": 0,
             "http_retries": 0,
@@ -621,6 +627,31 @@ class SpotifyClient:
     def _inc(self, key: str, n: int = 1) -> None:
         with self._stats_lock:
             self.stats[key] = self.stats.get(key, 0) + n
+
+    def _acquire_search_slot(self) -> None:
+        """Global gate for /search to avoid worker stampede and 429 bursts."""
+        while True:
+            with self._search_lock:
+                now = time.monotonic()
+                ready_at = max(self._search_next_at, self._search_cooldown_until)
+                if now >= ready_at:
+                    self._search_next_at = now + self.search_min_interval
+                    return
+                delay = ready_at - now
+            time.sleep(min(delay, 0.5))
+
+    def _note_search_rate_limit(self, delay: float) -> None:
+        with self._search_lock:
+            self._search_cooldown_until = max(self._search_cooldown_until, time.monotonic() + delay)
+            self.search_min_interval = min(1.5, max(0.15, self.search_min_interval * 1.2))
+
+    def _note_search_success(self) -> None:
+        with self._search_lock:
+            if self.search_min_interval > self.base_search_min_interval:
+                self.search_min_interval = max(
+                    self.base_search_min_interval,
+                    self.search_min_interval * 0.98,
+                )
 
     def request(
         self,
@@ -638,6 +669,8 @@ class SpotifyClient:
             self._inc("http_calls")
             token = self.auth.access_token(self.scopes)
             headers = {"Authorization": f"Bearer {token}"}
+            if method.upper() == "GET" and path == "/search":
+                self._acquire_search_slot()
             try:
                 resp = requests.request(
                     method,
@@ -664,6 +697,8 @@ class SpotifyClient:
                 raise
 
             if resp.status_code in expected:
+                if method.upper() == "GET" and path == "/search":
+                    self._note_search_success()
                 return resp
 
             if resp.status_code == 401 and attempt <= self.max_retries:
@@ -679,8 +714,14 @@ class SpotifyClient:
                 retry_after = resp.headers.get("Retry-After")
                 delay = float(retry_after) if retry_after else min(30.0, 2 ** attempt)
                 delay += random.uniform(0, 0.5)
+                if method.upper() == "GET" and path == "/search":
+                    self._note_search_rate_limit(delay)
                 self.logger.warning(
-                    "Rate-limited (%s %s). Waiting %.2fs before retry", method, path, delay
+                    "Rate-limited (%s %s). Waiting %.2fs before retry (search_interval=%.2fs)",
+                    method,
+                    path,
+                    delay,
+                    self.search_min_interval if path == "/search" else 0.0,
                 )
                 time.sleep(delay)
                 continue
@@ -1520,7 +1561,17 @@ def sync_command(args: argparse.Namespace) -> int:
         callback_wait_seconds=args.oauth_callback_wait_seconds,
         logger=logger,
     )
-    client = SpotifyClient(auth=auth, scopes=scopes, logger=logger)
+    client = SpotifyClient(
+        auth=auth,
+        scopes=scopes,
+        logger=logger,
+        search_min_interval_seconds=args.search_min_interval,
+    )
+    logger.info(
+        "Search throttle: min interval %.2fs; mapping workers=%d",
+        args.search_min_interval,
+        args.max_workers,
+    )
 
     logger.info("Phase 2/5: Validating Spotify auth and profile")
     me = client.get_me()
@@ -1644,7 +1695,13 @@ def build_parser() -> argparse.ArgumentParser:
     sync_p.add_argument("--spotify-client-secret", default="")
     sync_p.add_argument("--spotify-redirect-uri", default="")
     sync_p.add_argument("--search-market", default="")
-    sync_p.add_argument("--max-workers", type=int, default=6)
+    sync_p.add_argument("--max-workers", type=int, default=4)
+    sync_p.add_argument(
+        "--search-min-interval",
+        type=float,
+        default=0.15,
+        help="Global minimum spacing between Spotify /search requests (seconds).",
+    )
     sync_p.add_argument(
         "--playlist-strategy",
         choices=["create", "create-missing", "append", "replace"],
