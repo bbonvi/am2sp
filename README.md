@@ -2,6 +2,11 @@
 
 CLI to transfer Music.app library + playlists to Spotify.
 
+## Requirements
+
+- Transfer/extract works only on macOS (or an OrbStack guest that can call host `mac osascript`).
+- Apple Music (`Music.app`) must be open while running `extract` or `sync`.
+
 Priorities:
 - Preserve library order by Music.app `dateAdded`.
 - Sync playlists with track order.
