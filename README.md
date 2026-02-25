@@ -1,10 +1,10 @@
 # am2sp
 
-CLI to transfer Music.app library + playlists to Spotify.
+This tool exists to preserve original Music.app add chronology when transferring to Spotify, so tracks appear there with the correct historical added dates as if they were added on those dates originally.
 
 ## Requirements
 
-- Transfer/extract works only on macOS (or an OrbStack guest that can call host `mac osascript`).
+- Transfer/extract works only on macOS.
 - Apple Music (`Music.app`) must be open while running `extract` or `sync`.
 
 Priorities:
