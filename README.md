@@ -1,6 +1,6 @@
 # am2sp
 
-This tool exists to preserve original Music.app add chronology when transferring to Spotify, so tracks appear there with the correct historical added dates as if they were added on those dates originally.
+Transfer your Music.app library to Spotify while preserving each track's original add date and library order.
 
 ## Requirements
 
